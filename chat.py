@@ -49,24 +49,38 @@ def load_dotenv(path: Path) -> None:
 
 
 def parse_config(path: Path) -> dict[str, Any]:
-    """Read the flat scalar subset of YAML used by config.yaml."""
+    """Read the scalar and nested-mapping subset of YAML used by config.yaml."""
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {path}")
 
     config: dict[str, Any] = {}
+    parents: list[tuple[int, dict[str, Any]]] = [(-1, config)]
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        indentation = len(line) - len(line.lstrip())
+        if "\t" in line[:indentation]:
+            raise ValueError(f"Invalid config indentation at {path}:{line_number}")
+        while parents[-1][0] >= indentation:
+            parents.pop()
+        parent = parents[-1][1]
         match = re.fullmatch(r"([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*", stripped)
         if not match:
             raise ValueError(f"Invalid config at {path}:{line_number}")
         key, raw_value = match.groups()
+        if key in parent:
+            raise ValueError(f"Duplicate config key at {path}:{line_number}: {key}")
         value = raw_value.split(" #", 1)[0].strip()
-        if value.startswith(("'", '"')) and value.endswith(value[0]):
+        if not value:
+            parent[key] = {}
+            parents.append((indentation, parent[key]))
+        elif value.startswith(("'", '"')) and value.endswith(value[0]):
             value = value[1:-1]
+            parent[key] = value
         elif value.lower() in {"true", "false"}:
             value = value.lower() == "true"
+            parent[key] = value
         else:
             try:
                 value = int(value)
@@ -75,18 +89,48 @@ def parse_config(path: Path) -> dict[str, Any]:
                     value = float(value)
                 except ValueError:
                     pass
-        config[key] = value
+            parent[key] = value
     return config
 
 
 def validate_config(config: dict[str, Any]) -> None:
+    profiles = config.get("models")
+    if profiles is not None:
+        if not isinstance(profiles, dict) or not profiles:
+            raise ValueError("models must contain at least one named model")
+        default_model = config.get("default_model", next(iter(profiles)))
+        if not isinstance(default_model, str) or default_model not in profiles:
+            raise ValueError("default_model must name a configured model")
+        for name, profile in profiles.items():
+            if not isinstance(name, str) or not isinstance(profile, dict):
+                raise ValueError("Each models entry must be a named mapping")
+            validate_profile(profile, f"models.{name}")
+        shared = {
+            key: value for key, value in config.items() if key not in {"models", "default_model"}
+        }
+        validate_options(shared)
+        for profile in profiles.values():
+            validate_options(profile)
+        return
+    validate_profile(config, "config")
+    validate_options(config)
+
+
+def validate_profile(profile: dict[str, Any], label: str) -> None:
     required = ("base_url", "model", "api_key_env")
-    missing = [key for key in required if not config.get(key)]
+    missing = [key for key in required if not profile.get(key)]
     if missing:
-        raise ValueError(f"Missing config value(s): {', '.join(missing)}")
-    if not isinstance(config.get("max_turns", 10), int) or config.get("max_turns", 10) < 1:
+        raise ValueError(f"Missing {label} value(s): {', '.join(missing)}")
+    if any(not isinstance(profile[key], str) for key in required):
+        raise ValueError(f"{label} base_url, model, and api_key_env must be strings")
+
+
+def validate_options(config: dict[str, Any]) -> None:
+    max_turns = config.get("max_turns", 10)
+    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
         raise ValueError("max_turns must be a positive integer")
-    if not isinstance(config.get("timeout", 60), (int, float)) or config.get("timeout", 60) <= 0:
+    timeout = config.get("timeout", 60)
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
         raise ValueError("timeout must be a positive number")
 
 
@@ -107,6 +151,10 @@ class Chat:
         self.history_dir = history_dir
         self.env_path = env_path
         self.config: dict[str, Any] = {}
+        self.models: dict[str, dict[str, Any]] = {}
+        self.default_model = "default"
+        self.model_name = "default"
+        self.shared_config: dict[str, Any] = {}
         self.prompt = ""
         self.messages: list[dict[str, str]] = []
         self.api_calls: list[dict[str, Any]] = []
@@ -120,12 +168,35 @@ class Chat:
         load_dotenv(self.env_path)
         config = parse_config(self.config_path)
         validate_config(config)
+        if "models" in config:
+            models = config["models"]
+            default_model = config.get("default_model", next(iter(models)))
+            shared_config = {
+                key: value
+                for key, value in config.items()
+                if key not in {"models", "default_model"}
+            }
+        else:
+            models = {"default": config}
+            default_model = "default"
+            shared_config = {}
+        selected_model = self.model_name if self.model_name in models else default_model
         if not self.prompt_path.exists():
             raise FileNotFoundError(f"Prompt file not found: {self.prompt_path}")
-        self.config = config
+        self.models = models
+        self.default_model = default_model
+        self.shared_config = shared_config
+        self.model_name = selected_model
+        self.config = {**shared_config, **models[selected_model]}
         self.prompt = self.prompt_path.read_text(encoding="utf-8").strip()
         if not self.prompt:
             raise ValueError(f"Prompt file is empty: {self.prompt_path}")
+
+    def select_model(self, name: str) -> None:
+        if name not in self.models:
+            raise ValueError(f"Unknown model '{name}'. Use /models to list configured models.")
+        self.model_name = name
+        self.config = {**self.shared_config, **self.models[name]}
 
     def load_latest(self) -> None:
         files = sorted(self.history_dir.glob("session-*.json")) if self.history_dir.exists() else []
@@ -327,6 +398,8 @@ class Chat:
 
 
 HELP = """Commands:
+  /models  List configured models and the current selection
+  /model   <name> Switch to a configured model
   /reset   Clear conversation messages (keep API call history)
   /clean   Delete all history archives and start a new session
   /reload  Reload config.yaml and prompt.md
@@ -336,7 +409,10 @@ HELP = """Commands:
 
 
 def run(chat: Chat) -> None:
-    print(f"Prompt testing with {chat.config['model']}. Type /help for commands.")
+    print(
+        f"Prompt testing with {chat.model_name} ({chat.config['model']}). "
+        "Type /help for commands."
+    )
     while True:
         try:
             text = input("you> ").strip()
@@ -346,12 +422,28 @@ def run(chat: Chat) -> None:
         if not text:
             continue
         if text.startswith("/"):
-            command = text[1:].lower()
+            command_parts = text[1:].split(maxsplit=1)
+            command = command_parts[0].lower() if command_parts else ""
+            argument = command_parts[1] if len(command_parts) > 1 else ""
             if command in {"quit", "exit"}:
                 print("Bye.")
                 return
             if command == "help":
                 print(HELP)
+            elif command == "models":
+                for name, profile in chat.models.items():
+                    selected = " (current)" if name == chat.model_name else ""
+                    print(f"  {name}: {profile['model']}{selected}")
+            elif command == "model":
+                name = argument.strip()
+                if not name:
+                    print("Usage: /model <name>")
+                else:
+                    try:
+                        chat.select_model(name)
+                        print(f"Switched to {chat.model_name} ({chat.config['model']}).")
+                    except ValueError as error:
+                        print(error)
             elif command == "save":
                 chat.save()
                 print(f"Saved {chat.history_path.name if chat.history_path else 'session'}.")

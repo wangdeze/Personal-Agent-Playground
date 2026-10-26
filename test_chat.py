@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import select
@@ -40,6 +41,71 @@ class ChatTests(unittest.TestCase):
         config = chat.parse_config(self.config_path)
         self.assertEqual(config["max_turns"], 2)
         self.assertEqual(config["base_url"], "https://example.test/v1")
+
+    def test_named_models_parse_and_switch(self):
+        self.config_path.write_text(
+            "default_model: provider-a\n"
+            "models:\n"
+            "  provider-a:\n"
+            "    base_url: https://a.example/v1\n"
+            "    model: model-a\n"
+            "    api_key_env: A_API_KEY\n"
+            "  provider-b:\n"
+            "    base_url: https://b.example/v1\n"
+            "    model: model-b\n"
+            "    api_key_env: B_API_KEY\n"
+            "max_turns: 4\n",
+            encoding="utf-8",
+        )
+        instance = self.make_chat()
+
+        self.assertEqual(instance.model_name, "provider-a")
+        self.assertEqual(instance.config["max_turns"], 4)
+        instance.select_model("provider-b")
+        self.assertEqual(instance.config["base_url"], "https://b.example/v1")
+        self.assertEqual(instance.config["model"], "model-b")
+        self.assertEqual(instance.config["api_key_env"], "B_API_KEY")
+        with self.assertRaisesRegex(ValueError, "Unknown model"):
+            instance.select_model("missing")
+
+    def test_project_config_selects_deepseek_by_default(self):
+        config = chat.parse_config(chat.CONFIG_PATH)
+        chat.validate_config(config)
+        self.config_path.write_text(
+            chat.CONFIG_PATH.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        instance = self.make_chat()
+
+        self.assertEqual(instance.model_name, "deepseek")
+        self.assertEqual(instance.config["base_url"], "https://api.deepseek.com")
+        self.assertEqual(instance.config["model"], "deepseek-flash")
+        self.assertEqual(instance.config["api_key_env"], "DEEPSEEK_API_KEY")
+
+    def test_cli_lists_and_switches_models(self):
+        self.config_path.write_text(
+            "default_model: provider-a\n"
+            "models:\n"
+            "  provider-a:\n"
+            "    base_url: https://a.example/v1\n"
+            "    model: model-a\n"
+            "    api_key_env: A_API_KEY\n"
+            "  provider-b:\n"
+            "    base_url: https://b.example/v1\n"
+            "    model: model-b\n"
+            "    api_key_env: B_API_KEY\n",
+            encoding="utf-8",
+        )
+        instance = self.make_chat()
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=["/models", "/model provider-b", "/quit"]):
+            with patch("sys.stdout", output):
+                chat.run(instance)
+
+        self.assertIn("provider-a: model-a (current)", output.getvalue())
+        self.assertIn("Switched to provider-b (model-b).", output.getvalue())
+        self.assertEqual(instance.model_name, "provider-b")
 
     def test_load_dotenv_sets_values_without_overriding_environment(self):
         dotenv_path = self.root / ".env"
@@ -129,6 +195,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(answer, "hello back")
         sent_request = urlopen.call_args.args[0]
         self.assertEqual(sent_request.full_url, "https://example.test/v1/chat/completions")
+        self.assertEqual(sent_request.get_header("Authorization"), "Bearer test-secret")
         self.assertEqual(instance.messages[-1], {"role": "assistant", "content": "hello back"})
         saved = json.loads(instance.history_path.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -230,6 +297,45 @@ class ChatTests(unittest.TestCase):
         self.assertFalse(old_path.exists())
         self.assertFalse(new_path.exists())
         self.assertEqual(instance.api_calls, [])
+
+    def test_request_uses_selected_provider_and_credentials(self):
+        self.config_path.write_text(
+            "default_model: provider-a\n"
+            "models:\n"
+            "  provider-a:\n"
+            "    base_url: https://a.example/v1\n"
+            "    model: model-a\n"
+            "    api_key_env: A_API_KEY\n"
+            "  provider-b:\n"
+            "    base_url: https://b.example/v1\n"
+            "    model: model-b\n"
+            "    api_key_env: B_API_KEY\n",
+            encoding="utf-8",
+        )
+        instance = self.make_chat()
+        instance.select_model("provider-b")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps(
+                    {"choices": [{"message": {"content": "reply"}}]}
+                ).encode()
+
+        with patch.dict(os.environ, {"B_API_KEY": "provider-b-secret"}):
+            with patch("chat.urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+                instance.request("hello")
+
+        sent_request = urlopen.call_args.args[0]
+        payload = json.loads(sent_request.data.decode("utf-8"))
+        self.assertEqual(sent_request.full_url, "https://b.example/v1/chat/completions")
+        self.assertEqual(payload["model"], "model-b")
+        self.assertEqual(sent_request.get_header("Authorization"), "Bearer provider-b-secret")
 
 
 if __name__ == "__main__":

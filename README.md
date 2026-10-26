@@ -23,14 +23,31 @@ agent-playground/
 
 ## 使用
 
-需要 Python 3.10 或更新版本。将 API Key 放入项目根目录的 `.env`（该文件已加入 `.gitignore`），编辑 `prompt.md` 和 `config.yaml` 后运行：
+需要 Python 3.10 或更新版本。将各供应商的 API Key 放入项目根目录的 `.env`（该文件已加入 `.gitignore`），编辑 `prompt.md` 和 `config.yaml` 后运行：
 
 ```sh
-OPENROUTER_API_KEY="your-api-key"
 python3 chat.py
 ```
 
-配置中的 `base_url` 应为 API 版本根路径（例如 `https://api.openai.com/v1`）；程序会在其后追加 `/chat/completions`。`api_key_env` 指定 `.env` 中的密钥变量名；已有的 shell 环境变量优先于 `.env`。配置文件支持简单的扁平 `key: value` 标量，不需要 YAML 第三方依赖。
+使用 `models` 配置多个 OpenAI Chat Completions 兼容服务，每项指定 `base_url`、`model` 和 `api_key_env`；`default_model` 指定启动时使用的配置名称。`max_turns`、`timeout` 和 `temperature` 可放在顶层作为所有模型的默认值，也可以在各模型项中覆盖。配置文件支持简单的嵌套映射和标量，不需要 YAML 第三方依赖；原有扁平单模型配置仍然兼容。
+
+```yaml
+default_model: openrouter
+models:
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    model: openai/gpt-4o-mini
+    api_key_env: OPENROUTER_API_KEY
+  openai:
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini
+    api_key_env: OPENAI_API_KEY
+max_turns: 10
+timeout: 60
+temperature: 0.7
+```
+
+`base_url` 应为 API 版本根路径（例如 `https://api.openai.com/v1`）；程序会在其后追加 `/chat/completions`。`api_key_env` 指定 `.env` 中的密钥变量名；已有的 shell 环境变量优先于 `.env`。启动后使用 `/models` 查看配置，或使用 `/model <名称>` 即时切换。
 
 在交互提示符输入 `/help` 查看命令。`/reset` 保留当前存档并开始一个新的 session 文件；`/clean` 删除所有存档并开始新会话；`/reload` 重新读取配置和 Prompt。会话存档位于 `history/`，请求日志不包含 API Key。旧格式存档会在加载时自动迁移。
 
