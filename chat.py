@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import readline  # noqa: F401  # Enable Unicode-aware editing for input().
+except ImportError:
+    pass
+
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"

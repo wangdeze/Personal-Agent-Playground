@@ -1,6 +1,12 @@
+import importlib.util
 import json
 import os
+import select
+import struct
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -133,6 +139,60 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(saved["turns"][0]["api_call"]["status"], "success")
         self.assertEqual(saved["turns"][0]["assistant_response"], "hello back")
         self.assertNotIn("test-secret", instance.history_path.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX terminal")
+    def test_long_cjk_input_can_be_corrected_after_wrapping(self):
+        if importlib.util.find_spec("readline") is None:
+            self.skipTest("Python readline is unavailable")
+
+        import fcntl
+        import pty
+        import termios
+
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 20, 0, 0))
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import chat, json; print('RESULT:' + json.dumps(input('you> ')))",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            cwd=Path(__file__).resolve().parent,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        os.close(slave_fd)
+
+        def read_until(marker: bytes, output: bytearray, start: int = 0) -> None:
+            deadline = time.monotonic() + 5
+            while marker not in output[start:] and time.monotonic() < deadline:
+                ready, _, _ = select.select([master_fd], [], [], 0.1)
+                if ready:
+                    try:
+                        output.extend(os.read(master_fd, 65536))
+                    except OSError:
+                        break
+            self.assertIn(marker, output[start:])
+
+        try:
+            output = bytearray()
+            read_until(b"you> ", output)
+            os.write(master_fd, ("你" * 30 + "XYZ" + "\x7f" * 5 + "B\n").encode())
+            read_until(b"RESULT:", output)
+            result_start = output.index(b"RESULT:") + len(b"RESULT:")
+            read_until(b"\n", output, result_start)
+            self.assertEqual(
+                json.loads(output[result_start:].splitlines()[0].decode("utf-8")),
+                "你" * 28 + "B",
+            )
+            process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            os.close(master_fd)
 
     def test_reset_starts_new_archive_and_clean_removes_old_archives(self):
         instance = self.make_chat()
